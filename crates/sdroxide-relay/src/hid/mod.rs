@@ -114,3 +114,45 @@ pub fn enumerate(ids: &[(u16, u16)]) -> Vec<HidEntry> {
 pub fn open(key: &str) -> Result<Box<dyn HidDev>> {
     backend::open(key)
 }
+
+/// The USB ids a Windows HID interface path spells out —
+/// `\\?\hid#vid_0c26&pid_001e#…` — or `None` for a path that does not carry
+/// them in that form (a Bluetooth device's, say).
+///
+/// Windows answers "what is this device" only to a handle, so without this the
+/// enumeration would open every HID device on the machine to find one: fine
+/// when the settings dialog lists relays, not once a second while a worker
+/// waits for a knob to be plugged in. Platform-neutral so it is tested here.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn ids_in_interface_path(path: &str) -> Option<(u16, u16)> {
+    let lower = path.to_ascii_lowercase();
+    let hex_after = |tag: &str| {
+        let at = lower.find(tag)? + tag.len();
+        let digits = lower.get(at..at + 4)?;
+        u16::from_str_radix(digits, 16).ok()
+    };
+    Some((hex_after("vid_")?, hex_after("pid_")?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ids_in_interface_path;
+
+    #[test]
+    fn a_usb_interface_path_names_its_ids() {
+        let p =
+            r"\\?\hid#vid_0C26&pid_001e#7&2a7d6c1b&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!(ids_in_interface_path(p), Some((0x0c26, 0x001e)));
+        let mi =
+            r"\\?\hid#vid_0d8c&pid_013c&mi_03#8&1b2c&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!(ids_in_interface_path(mi), Some((0x0d8c, 0x013c)));
+    }
+
+    #[test]
+    fn a_path_without_them_says_so_rather_than_guessing() {
+        let bt = r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002046d_pid&b01a#9&1";
+        assert_eq!(ids_in_interface_path(bt), None);
+        assert_eq!(ids_in_interface_path(r"\\?\hid#vid_zz12&pid_0001#x"), None);
+        assert_eq!(ids_in_interface_path("vid_0c2"), None);
+    }
+}

@@ -17,6 +17,9 @@ pub(crate) struct Rc28Link {
     enabled: bool,
     /// LEDs last requested, so an unchanged state is not re-sent every frame.
     leds: Option<u8>,
+    /// Events a test hands the next [`Self::poll`], ahead of the device's.
+    #[cfg(test)]
+    pub(crate) injected: Vec<Rc28Event>,
 }
 
 impl Rc28Link {
@@ -25,7 +28,13 @@ impl Rc28Link {
         {
             let ctx = ctx.clone();
             let handle = sdroxide_rc28::spawn(enabled, move || crate::repaint::animate(&ctx));
-            Rc28Link { handle, enabled, leds: None }
+            Rc28Link {
+                handle,
+                enabled,
+                leds: None,
+                #[cfg(test)]
+                injected: Vec::new(),
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -54,6 +63,9 @@ impl Rc28Link {
         let events = self.handle.poll();
         #[cfg(target_arch = "wasm32")]
         let events = self.web.poll();
+        #[cfg(test)]
+        let events: Vec<Rc28Event> =
+            std::mem::take(&mut self.injected).into_iter().chain(events).collect();
         if events.iter().any(|e| matches!(e, Rc28Event::Connected(_))) {
             // A fresh device shows nothing until told.
             self.leds = None;

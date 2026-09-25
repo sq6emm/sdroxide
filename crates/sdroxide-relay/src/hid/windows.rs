@@ -392,9 +392,16 @@ pub fn enumerate(ids: &[(u16, u16)]) -> Vec<HidEntry> {
             continue;
         }
 
-        // Opening is the only way to ask what a HID device is on Windows. Done
-        // for every HID device on the machine, which is why it is shared and
-        // immediately closed — and why this is not called in a loop.
+        // Opening is the only sure way to ask what a HID device is on Windows,
+        // so a path that already names other ids is passed over unopened —
+        // what lets the RC-28 worker look for its knob once a second. Only a
+        // path that does not say (Bluetooth) is opened to find out, shared
+        // and immediately closed.
+        if !ids.is_empty()
+            && super::ids_in_interface_path(&path).is_some_and(|id| !ids.contains(&id))
+        {
+            continue;
+        }
         let Ok(h) = open_path(&path) else { continue };
         let mut attrs = HiddAttributes {
             size: std::mem::size_of::<HiddAttributes>() as u32,

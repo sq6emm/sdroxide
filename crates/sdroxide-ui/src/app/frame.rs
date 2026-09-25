@@ -1782,6 +1782,59 @@ impl SdroxideApp {
         }
     }
 
+    /// This radio's inputs while the window is hidden and no `ui` pass runs —
+    /// see [`crate::input::InputRuntime::poll_hidden`]. The focused tab lets go
+    /// of what it holds; every other tab only discards, as it would with the
+    /// window shown. Returns when to be called again.
+    pub(crate) fn poll_inputs_hidden(&mut self) -> Option<std::time::Duration> {
+        if !self.focused {
+            #[cfg(not(target_arch = "wasm32"))]
+            self.input.discard_midi();
+            self.input.discard_rc28();
+            return None;
+        }
+        let mut cmds = Vec::new();
+        let SdroxideApp {
+            input,
+            state,
+            view,
+            help,
+            show_settings,
+            show_logbook,
+            show_spots,
+            show_memories,
+            show_voice,
+            caps,
+            cw_key_down,
+            ..
+        } = self;
+        // Held by hand on the keyboard, which cannot be read now either — as
+        // in `release_held_controls`.
+        if *cw_key_down {
+            *cw_key_down = false;
+            cmds.push(Command::CwKey(false));
+        }
+        let rig_squelch = caps.as_ref().is_some_and(|c| c.commands_squelch);
+        let mut sink = crate::input::UiSink {
+            view,
+            help: &mut help.open,
+            settings: show_settings,
+            logbook: show_logbook,
+            spots: show_spots,
+            memories: show_memories,
+            voice: show_voice,
+            // Releases say nothing, and nothing else is applied here.
+            speech: &mut Vec::new(),
+            rig_squelch,
+            zoom_out: (state.center_hz, state.sample_rate),
+        };
+        let next = input.poll_hidden(state, &mut sink, &mut cmds);
+        for c in cmds {
+            self.ctrl.send(c);
+        }
+        next
+    }
+
     /// De-assert every held control. Closing the window while a footswitch or
     /// a bound key is down must not leave the transmitter keyed.
     pub(in crate::app) fn release_held_controls(&mut self, cmds: &mut Vec<Command>) {

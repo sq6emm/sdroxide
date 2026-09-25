@@ -1,0 +1,62 @@
+# Temporary: macOS test builds of the RC-28 review fixes. Not for merging.
+name: RC-28 macOS test build
+
+on:
+  push:
+    branches: [rc28-test-build]
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: macos-aarch64, os: macos-latest }
+          - { label: macos-x86_64, os: macos-15-intel }
+    env:
+      SDROXIDE_BUILD: rc28-test.${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - run: brew install cmake autoconf automake libtool
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rc28-${{ matrix.label }}
+      - name: Build web client
+        run: |
+          cargo install trunk --version 0.21.14 --locked
+          cd crates/sdroxide-web && trunk build --release
+      - name: Build
+        run: cargo build --release --locked -p sdroxide --no-default-features --features embed-web,rtl433
+      - name: Package
+        run: |
+          strip -x target/release/sdroxide
+          mkdir -p stage/sdroxide/voices
+          cp target/release/sdroxide LICENSE stage/sdroxide/
+          cp assets/voices/en_US-hfc_female-medium.onnx assets/voices/en_US-hfc_female-medium.onnx.json stage/sdroxide/voices/
+          tar czf sdroxide-rc28-test-${{ matrix.label }}.tar.gz -C stage sdroxide
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdroxide-rc28-test-${{ matrix.label }}
+          path: sdroxide-rc28-test-${{ matrix.label }}.tar.gz
+          retention-days: 14
+      # The same example the README names for settling a backend on hardware.
+      - name: Build the rc28 example
+        run: |
+          cargo build --release --locked -p sdroxide-rc28 --example rc28
+          cp target/release/examples/rc28 rc28-example-${{ matrix.label }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rc28-example-${{ matrix.label }}
+          path: rc28-example-${{ matrix.label }}
+          retention-days: 14

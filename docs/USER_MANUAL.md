@@ -11810,6 +11810,13 @@ whatever has focus, and a desk PTT that let go every time you typed a callsign
 would be useless. It is dropped when the RC-28 is unplugged, when you switch
 radio tabs, and after the **Unkey a held PTT after** timeout.
 
+While the window is minimised or fully covered, or the browser tab is in the
+background, the RC-28 still lets go: releasing TRANSMIT unkeys the rig then
+and there, and the timeout keeps running. Pressing it, or turning the knob,
+does nothing until the window is back — a radio nobody can see is not one to
+key or retune. In a background browser tab the release can take up to a second
+to land, since the browser wakes such a page only that often.
+
 On Linux the RC-28 needs the packaged udev rule, `60-sdroxide-rc28.rules`,
 which the `.deb` installs; the README's *Icom RC-28 permissions* has the two
 commands for any other install.

@@ -76,6 +76,9 @@ struct Held {
     action: Action,
     mode: ButtonMode,
     since: f64,
+    /// The same moment on the wall clock, for [`InputRuntime::poll_hidden`]:
+    /// while the window is hidden egui's clock stands still.
+    since_wall: f64,
 }
 
 /// Rolling tick-rate estimate for one action, driving speed-sensitive steps.
@@ -555,6 +558,29 @@ impl InputRuntime {
         }
     }
 
+    /// A runtime on `cfg` alone: no settings file read or written, no MIDI
+    /// worker, and an RC-28 link that is switched off.
+    #[cfg(test)]
+    fn for_test(cfg: InputSettings) -> Self {
+        let rc28 = crate::rc28::Rc28Link::new(false, &eframe::egui::Context::default());
+        InputRuntime {
+            cfg,
+            held: Vec::new(),
+            accum: HashMap::new(),
+            key_capture: None,
+            midi_learn: None,
+            learn_values: Vec::new(),
+            last_midi: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            midi: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            midi_sent: sdroxide_midi::MidiConfig::default(),
+            rc28,
+            rc28_detents: sdroxide_rc28::proto::Detents::default(),
+            last_rc28: None,
+        }
+    }
+
     pub fn persist(&self) {
         persist_input_settings(&self.cfg);
     }
@@ -595,7 +621,8 @@ impl InputRuntime {
 
     fn press(&mut self, src: HeldSource, action: Action, mode: ButtonMode, now: f64) {
         if mode == ButtonMode::Momentary && !self.held.iter().any(|h| h.src == src) {
-            self.held.push(Held { src, action, mode, since: now });
+            let since_wall = crate::time::now_unix_f64();
+            self.held.push(Held { src, action, mode, since: now, since_wall });
         }
     }
 
@@ -1162,6 +1189,96 @@ impl InputRuntime {
         self.rc28.set_leds(lit);
     }
 
+    /// The input runtime while the window is hidden — minimised, fully covered,
+    /// or a browser tab in the background — called from `App::logic`, since
+    /// eframe runs no `ui` pass then and nothing else here runs at all.
+    ///
+    /// Only what lets go of the rig is done. The keyboard and mouse cannot be
+    /// read, so their holds are released, as on losing focus. The RC-28's
+    /// releases and disconnects are applied as they arrive, and its holds
+    /// time out on the wall clock; its presses and turns are dropped, since
+    /// nobody is looking at the radio they would key or retune. Without this,
+    /// a TRANSMIT let go while the window was hidden left the rig keyed until
+    /// it was shown again — and then replayed the press and the release.
+    ///
+    /// Returns how long until the next RC-28 hold would time out, for the
+    /// caller to wake by: nothing else will.
+    pub(crate) fn poll_hidden(
+        &mut self,
+        state: &mut RadioState,
+        ui: &mut UiSink<'_>,
+        cmds: &mut Vec<Command>,
+    ) -> Option<std::time::Duration> {
+        use sdroxide_rc28::Rc28Event;
+        use sdroxide_rc28::proto::Input;
+
+        let unread: Vec<HeldSource> = self
+            .held
+            .iter()
+            .filter(|h| !matches!(h.src, HeldSource::Rc28(_)))
+            .map(|h| h.src)
+            .collect();
+        for src in unread {
+            if let Some(action) = self.release(src) {
+                apply_action(action, ActionInput::Release, ButtonMode::Momentary, state, ui, cmds);
+            }
+        }
+
+        for ev in self.rc28.poll() {
+            match ev {
+                Rc28Event::Input(Input::Key { key, down: false }) => {
+                    self.last_rc28 = Some(format!("{} released", key.label()));
+                    // `now` only times holds, and this starts none.
+                    self.rc28_key(key, false, 0.0, state, ui, cmds);
+                }
+                Rc28Event::Input(_) => {}
+                Rc28Event::Connected(_) => self.rc28_detents.reset(),
+                Rc28Event::Disconnected => {
+                    self.release_rc28_holds(state, ui, cmds);
+                    self.rc28_detents.reset();
+                }
+            }
+        }
+
+        let timeout = f64::from(self.cfg.ptt_hold_timeout_s);
+        let mut next: Option<f64> = None;
+        if timeout > 0.0 {
+            let now = crate::time::now_unix_f64();
+            let mut expired = Vec::new();
+            for h in &self.held {
+                let left = timeout - (now - h.since_wall);
+                if left <= 0.0 {
+                    expired.push(h.src);
+                } else {
+                    next = Some(next.map_or(left, |n| n.min(left)));
+                }
+            }
+            for src in expired {
+                if let Some(action) = self.release(src) {
+                    apply_action(
+                        action,
+                        ActionInput::Release,
+                        ButtonMode::Momentary,
+                        state,
+                        ui,
+                        cmds,
+                    );
+                }
+            }
+        }
+        // TRANSMIT's light goes out with the transmitter.
+        self.send_rc28_leds(state, ui);
+        // The browser's bridge has no way to wake the app when a report lands,
+        // as the native worker does, so a hidden page looks on its own. The
+        // browser runs a hidden page's timers about once a second at best,
+        // which is what a release waits for there.
+        #[cfg(target_arch = "wasm32")]
+        if self.cfg.rc28.enabled {
+            next = Some(next.map_or(0.25, |n| n.min(0.25)));
+        }
+        next.map(std::time::Duration::from_secs_f64)
+    }
+
     /// Drop what the RC-28 queued while this radio tab was not focused. See
     /// [`crate::rc28::Rc28Link::discard`].
     pub fn discard_rc28(&mut self) {
@@ -1331,6 +1448,106 @@ mod tests {
             // this after building the sink.
             zoom_out: (0.0, 0.0),
         }
+    }
+
+    fn rc28_key(key: sdroxide_rc28::proto::Key, down: bool) -> sdroxide_rc28::Rc28Event {
+        sdroxide_rc28::Rc28Event::Input(sdroxide_rc28::proto::Input::Key { key, down })
+    }
+
+    /// TRANSMIT pressed with the window shown, then let go while it is hidden
+    /// and no `ui` pass runs: the release has to unkey the rig there and then,
+    /// not when the window comes back.
+    #[test]
+    fn a_transmit_released_while_hidden_unkeys_at_once() {
+        use sdroxide_rc28::proto::Key;
+        let mut rt = InputRuntime::for_test(InputSettings::default());
+        let mut state = RadioState::default();
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        let mut cmds = Vec::new();
+        rt.rc28_key(Key::Transmit, true, 0.0, &mut state, &mut ui, &mut cmds);
+        assert_eq!(cmds, vec![Command::SetPtt(true)]);
+        cmds.clear();
+
+        rt.rc28.injected.push(rc28_key(Key::Transmit, false));
+        rt.poll_hidden(&mut state, &mut ui, &mut cmds);
+        assert_eq!(cmds, vec![Command::SetPtt(false)]);
+        assert!(!rt.any_held());
+    }
+
+    /// A press while hidden keys nothing — nobody is looking — and so is
+    /// never replayed when the window is shown again.
+    #[test]
+    fn a_transmit_pressed_while_hidden_is_dropped() {
+        use sdroxide_rc28::proto::{Input, Key};
+        let mut rt = InputRuntime::for_test(InputSettings::default());
+        let mut state = RadioState::default();
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        let mut cmds = Vec::new();
+        rt.rc28.injected.push(rc28_key(Key::Transmit, true));
+        rt.rc28.injected.push(sdroxide_rc28::Rc28Event::Input(Input::Turn(500)));
+        rt.poll_hidden(&mut state, &mut ui, &mut cmds);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(!rt.any_held());
+        assert!(rt.rc28.injected.is_empty());
+    }
+
+    /// The hold timeout runs on the wall clock while hidden, since egui's
+    /// stands still — and says when the next one is due, since nothing else
+    /// will wake a hidden window for it.
+    #[test]
+    fn the_hold_timeout_runs_while_hidden() {
+        use sdroxide_rc28::proto::Key;
+        let cfg = InputSettings { ptt_hold_timeout_s: 60.0, ..InputSettings::default() };
+        let mut rt = InputRuntime::for_test(cfg);
+        let mut state = RadioState::default();
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        let mut cmds = Vec::new();
+        rt.rc28_key(Key::Transmit, true, 0.0, &mut state, &mut ui, &mut cmds);
+        cmds.clear();
+
+        let next = rt.poll_hidden(&mut state, &mut ui, &mut cmds).expect("a hold to time");
+        assert!(next > std::time::Duration::from_secs(55), "{next:?}");
+        assert!(cmds.is_empty());
+
+        rt.held[0].since_wall -= 61.0;
+        rt.poll_hidden(&mut state, &mut ui, &mut cmds);
+        assert_eq!(cmds, vec![Command::SetPtt(false)]);
+        assert!(!rt.any_held());
+    }
+
+    /// A keyboard or mouse hold cannot see its key-up while hidden, so it
+    /// goes, as it does on losing focus. A disconnect takes the RC-28's.
+    #[test]
+    fn hiding_lets_go_of_keys_and_a_disconnect_of_the_rc28() {
+        use sdroxide_rc28::proto::Key;
+        let mut rt = InputRuntime::for_test(InputSettings::default());
+        let mut state = RadioState::default();
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        let mut cmds = Vec::new();
+        rt.press(HeldSource::Key(0), Action::TuneCarrier, ButtonMode::Momentary, 0.0);
+        rt.rc28_key(Key::Transmit, true, 0.0, &mut state, &mut ui, &mut cmds);
+        cmds.clear();
+
+        rt.poll_hidden(&mut state, &mut ui, &mut cmds);
+        assert_eq!(cmds, vec![Command::SetTune(false)]);
+        cmds.clear();
+
+        rt.rc28.injected.push(sdroxide_rc28::Rc28Event::Disconnected);
+        rt.poll_hidden(&mut state, &mut ui, &mut cmds);
+        assert_eq!(cmds, vec![Command::SetPtt(false)]);
+        assert!(!rt.any_held());
     }
 
     /// A relative tune must move the local state immediately (the optimistic

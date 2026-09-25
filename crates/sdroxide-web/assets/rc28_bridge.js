@@ -33,8 +33,9 @@
     const PRODUCT = 0x001e;
     const FILTERS = [{ vendorId: VENDOR, productId: PRODUCT }];
     // A tab left in the background still receives reports; once nothing is
-    // draining them, the oldest go first rather than the page growing without
-    // bound.
+    // draining them, knob-only reports go first rather than the page growing
+    // without bound. Nothing else is ever dropped: a lost TRANSMIT release or
+    // "disconnected" would leave the rig keyed.
     const QUEUE_MAX = 512;
 
     const SUPPORTED = window.isSecureContext && "hid" in navigator;
@@ -48,8 +49,27 @@
     // and two in flight at once may land in either order.
     let writing = Promise.resolve();
 
+    // Whether a queued item may be dropped: a state report (byte 0 = 1) whose
+    // button byte (5) matches the report before it — the knob moving, with no
+    // button changing. The first one queued is kept, since what came before
+    // it has already been drained.
+    function droppable(i) {
+        const a = queue[i];
+        const prev = queue[i - 1];
+        return i > 0 && a instanceof Uint8Array && prev instanceof Uint8Array &&
+            a[0] === 1 && prev[0] === 1 && a.length > 5 && prev.length > 5 &&
+            a[5] === prev[5];
+    }
+
     function push(item) {
-        if (queue.length >= QUEUE_MAX) queue.shift();
+        if (queue.length >= QUEUE_MAX) {
+            for (let i = 1; i < queue.length; i++) {
+                if (droppable(i)) {
+                    queue.splice(i, 1);
+                    break;
+                }
+            }
+        }
         queue.push(item);
     }
 

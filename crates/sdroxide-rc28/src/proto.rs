@@ -136,6 +136,11 @@ impl Decoder {
         out
     }
 
+    /// The buttons down as of the last report, as a mask of [`Key::bit`].
+    pub fn held(&self) -> u8 {
+        self.keys
+    }
+
     /// The device is gone: whatever it was holding is released, and the next
     /// device starts from nothing held.
     pub fn reset(&mut self) {

@@ -2,17 +2,20 @@
 //!
 //! Nothing is configured but on/off. There is no port to pick — the RC-28 has
 //! one USB id and nobody owns two — so the worker opens the first one it finds,
-//! and looks again once a second while it has none.
+//! and looks again once a second while it has none. The look is by USB id
+//! before anything is opened (see [`hid::enumerate`]), so it is cheap enough
+//! to leave running with nothing plugged in.
 
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use sdroxide_relay::hid::{self, HidDev};
 use tracing::{debug, info, warn};
 
-use crate::proto::{self, Decoder, LED_LINK, Report};
+use crate::proto::{self, Decoder, Input, LED_LINK, Report};
 use crate::{Rc28Event, Rc28Status};
 
 /// How often to look for a device while there is none.
@@ -21,9 +24,49 @@ const RESCAN: Duration = Duration::from_secs(1);
 /// new LED state, a stop — can wait to be noticed, so it is kept short; the
 /// device sends every 10 ms while it is moving, so this costs nothing then.
 const READ_WAIT: Duration = Duration::from_millis(20);
-/// Depth of the event queue. A stalled UI drops knob steps rather than
-/// back-pressuring the reader.
-const QUEUE: usize = 512;
+/// How long a button may be held with nothing heard from the device before
+/// the worker asks whether it is still there.
+///
+/// A held button with the knob still sends nothing at all, so an unplug then
+/// is noticed only by what the platform says about it — and a platform that
+/// says nothing (a macOS removal callback that never fires) would leave
+/// TRANSMIT held until the hold timeout. A write to a device that has gone
+/// fails everywhere, so one is made: the firmware request, which changes
+/// nothing on the device and whose answer is harmless.
+const PROBE: Duration = Duration::from_millis(500);
+
+/// Events on their way to the app, in the order they happened.
+///
+/// A queue rather than a bounded channel so that nothing is ever dropped: a
+/// TRANSMIT release or a disconnect lost to a full channel would be a rig
+/// left keyed. What keeps it from growing is that a knob turn merges into a
+/// turn queued just before it, so a UI that stops draining — a stalled frame,
+/// a window nobody is drawing — holds one entry per press, release and
+/// replug, which a hand cannot produce fast enough to matter.
+#[derive(Default)]
+struct Queue(Mutex<VecDeque<Rc28Event>>);
+
+impl Queue {
+    fn lock(&self) -> MutexGuard<'_, VecDeque<Rc28Event>> {
+        // A panic elsewhere leaves the queue itself intact.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, e: Rc28Event) {
+        let mut q = self.lock();
+        if let (Rc28Event::Input(Input::Turn(n)), Some(Rc28Event::Input(Input::Turn(m)))) =
+            (&e, q.back_mut())
+        {
+            *m = m.saturating_add(*n);
+            return;
+        }
+        q.push_back(e);
+    }
+
+    fn drain(&self) -> Vec<Rc28Event> {
+        self.lock().drain(..).collect()
+    }
+}
 
 enum Ctl {
     Enabled(bool),
@@ -32,12 +75,16 @@ enum Ctl {
     Stop,
 }
 
-/// The app's view of the RC-28: a worker thread plus two channels.
+/// The app's view of the RC-28: a worker thread, a control channel, and the
+/// queue it reports into.
 pub struct Rc28Handle {
     ctl: Sender<Ctl>,
-    events: Receiver<Rc28Event>,
+    events: Arc<Queue>,
     status: Arc<Mutex<Rc28Status>>,
     thread: Option<JoinHandle<()>>,
+    /// Whether a worker found to have stopped has been reported as a
+    /// disconnect — once, since there is nothing after it to report.
+    dead: bool,
 }
 
 impl Rc28Handle {
@@ -63,12 +110,25 @@ impl Rc28Handle {
     }
 
     /// Everything that has arrived since the last call. Non-blocking.
+    ///
+    /// A worker that has stopped — it panicked, or never started — reads as a
+    /// [`Rc28Event::Disconnected`], so that whatever the device was holding is
+    /// let go rather than left waiting on a release nobody will send.
     pub fn poll(&mut self) -> Vec<Rc28Event> {
-        self.events.try_iter().collect()
+        let mut out = self.events.drain();
+        if !self.dead && self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
+            self.dead = true;
+            warn!("the RC-28 worker has stopped");
+            let mut s = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+            s.connected = false;
+            s.error = Some("the RC-28 worker has stopped — restart sdroxide".into());
+            out.push(Rc28Event::Disconnected);
+        }
+        out
     }
 
     pub fn status(&self) -> Rc28Status {
-        self.status.lock().map(|s| s.clone()).unwrap_or_default()
+        self.status.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 }
 
@@ -85,7 +145,8 @@ impl Drop for Rc28Handle {
 /// can repaint at once rather than waiting out its idle poll.
 pub fn spawn(enabled: bool, wake: impl Fn() + Send + Sync + 'static) -> Rc28Handle {
     let (ctl_tx, ctl_rx) = unbounded();
-    let (ev_tx, ev_rx) = bounded(QUEUE);
+    let events = Arc::new(Queue::default());
+    let ev = Arc::clone(&events);
     let status = Arc::new(Mutex::new(Rc28Status::default()));
     let st = Arc::clone(&status);
     let thread = std::thread::Builder::new()
@@ -93,7 +154,7 @@ pub fn spawn(enabled: bool, wake: impl Fn() + Send + Sync + 'static) -> Rc28Hand
         .spawn(move || {
             Worker {
                 enabled,
-                ev: ev_tx,
+                ev,
                 status: st,
                 wake: Box::new(wake),
                 dev: None,
@@ -101,16 +162,17 @@ pub fn spawn(enabled: bool, wake: impl Fn() + Send + Sync + 'static) -> Rc28Hand
                 leds: None,
                 leds_sent: None,
                 next_scan: Instant::now(),
+                last_heard: Instant::now(),
             }
             .run(ctl_rx)
         })
         .ok();
-    Rc28Handle { ctl: ctl_tx, events: ev_rx, status, thread }
+    Rc28Handle { ctl: ctl_tx, events, status, thread, dead: false }
 }
 
 struct Worker {
     enabled: bool,
-    ev: Sender<Rc28Event>,
+    ev: Arc<Queue>,
     status: Arc<Mutex<Rc28Status>>,
     wake: Box<dyn Fn() + Send + Sync>,
     dev: Option<Box<dyn HidDev>>,
@@ -121,6 +183,8 @@ struct Worker {
     /// What this worker last told the device, LINK included.
     leds_sent: Option<u8>,
     next_scan: Instant,
+    /// When the open device last answered, or was last probed.
+    last_heard: Instant,
 }
 
 impl Worker {
@@ -180,19 +244,17 @@ impl Worker {
             }
             self.write_leds();
             self.read();
+            self.probe();
         }
     }
 
     fn set_status(&self, f: impl FnOnce(&mut Rc28Status)) {
-        if let Ok(mut s) = self.status.lock() {
-            f(&mut s);
-        }
+        f(&mut self.status.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
     fn emit(&self, e: Rc28Event) {
-        if self.ev.try_send(e).is_ok() {
-            (self.wake)();
-        }
+        self.ev.push(e);
+        (self.wake)();
     }
 
     fn open(&mut self) {
@@ -213,7 +275,20 @@ impl Worker {
                     ),
                     other => format!("cannot open the RC-28 at {}: {other}", entry.key),
                 };
-                warn!("{msg}");
+                // Retried every second, so said once rather than every time:
+                // the panel shows it for as long as it lasts.
+                let repeated = self
+                    .status
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| *e == msg);
+                if repeated {
+                    debug!("{msg}");
+                } else {
+                    warn!("{msg}");
+                }
                 self.set_status(|s| s.error = Some(msg));
                 return;
             }
@@ -226,6 +301,7 @@ impl Worker {
         self.dev = Some(dev);
         self.decoder.reset();
         self.leds_sent = None;
+        self.last_heard = Instant::now();
         let n = name.clone();
         self.set_status(move |s| {
             s.connected = true;
@@ -284,10 +360,15 @@ impl Worker {
         match dev.read_input(&mut buf, READ_WAIT) {
             Ok(Some(n)) => match Report::parse(&buf[..n]) {
                 Some(Report::Firmware(v)) => {
-                    info!("RC-28 firmware {v}");
-                    self.set_status(|s| s.firmware = v);
+                    self.last_heard = Instant::now();
+                    // Also the answer to every probe, so only news is logged.
+                    if self.status().firmware != v {
+                        info!("RC-28 firmware {v}");
+                        self.set_status(|s| s.firmware = v);
+                    }
                 }
                 Some(r) => {
+                    self.last_heard = Instant::now();
                     for i in self.decoder.feed(&r) {
                         self.emit(Rc28Event::Input(i));
                     }
@@ -299,6 +380,24 @@ impl Worker {
                 info!("RC-28 went away: {e}");
                 self.lost();
             }
+        }
+    }
+
+    fn status(&self) -> Rc28Status {
+        self.status.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// With a button held and nothing heard for [`PROBE`], check the device is
+    /// still there. See [`PROBE`] for why.
+    fn probe(&mut self) {
+        if self.decoder.held() == 0 || self.last_heard.elapsed() < PROBE {
+            return;
+        }
+        let Some(dev) = self.dev.as_mut() else { return };
+        self.last_heard = Instant::now();
+        if let Err(e) = dev.write_output(0, &proto::firmware_request()) {
+            info!("RC-28 went away with a button held: {e}");
+            self.lost();
         }
     }
 }
@@ -316,6 +415,56 @@ mod tests {
         let started = Instant::now();
         drop(h);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn turns_merge_and_presses_and_releases_are_all_kept() {
+        use crate::proto::Key;
+        let q = Queue::default();
+        let key = |down| Rc28Event::Input(Input::Key { key: Key::Transmit, down });
+        // Far more than any bounded channel held: a UI that stopped draining
+        // mid-spin, with TRANSMIT pressed and released in the middle of it.
+        for _ in 0..10_000 {
+            q.push(Rc28Event::Input(Input::Turn(1)));
+        }
+        q.push(key(true));
+        for _ in 0..10_000 {
+            q.push(Rc28Event::Input(Input::Turn(-1)));
+        }
+        q.push(key(false));
+        q.push(Rc28Event::Disconnected);
+        assert_eq!(
+            q.drain(),
+            vec![
+                Rc28Event::Input(Input::Turn(10_000)),
+                key(true),
+                Rc28Event::Input(Input::Turn(-10_000)),
+                key(false),
+                Rc28Event::Disconnected,
+            ]
+        );
+    }
+
+    /// A worker that is gone cannot report the release of what it held, so
+    /// its absence has to read as the device going.
+    #[test]
+    fn a_worker_that_has_stopped_reads_as_a_disconnect_once() {
+        let (ctl, _rx) = unbounded();
+        let mut h = Rc28Handle {
+            ctl,
+            events: Arc::default(),
+            status: Arc::default(),
+            thread: Some(std::thread::spawn(|| {})),
+            dead: false,
+        };
+        let started = Instant::now();
+        while !h.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::yield_now();
+        }
+        assert_eq!(h.poll(), vec![Rc28Event::Disconnected]);
+        assert!(h.status().error.is_some());
+        assert!(h.poll().is_empty());
     }
 
     #[test]

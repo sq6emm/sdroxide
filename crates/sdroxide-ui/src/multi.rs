@@ -1212,6 +1212,21 @@ impl MultiApp {
 }
 
 impl eframe::App for MultiApp {
+    /// Runs before every `ui`, and on its own while the window is hidden —
+    /// minimised, fully covered, or a background browser tab — when eframe
+    /// runs no `ui` at all. Only that second case does anything here: it is
+    /// what lets a held control go while nobody can see the window. See
+    /// [`crate::input::InputRuntime::poll_hidden`].
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().visible()) != Some(false) {
+            return;
+        }
+        let next = self.tabs.iter_mut().filter_map(|t| t.app.poll_inputs_hidden()).min();
+        if let Some(d) = next {
+            crate::repaint::after(ctx, d);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         #[cfg(not(target_arch = "wasm32"))]

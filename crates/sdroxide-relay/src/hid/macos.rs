@@ -41,6 +41,8 @@ type CFTypeRef = *const c_void;
 type CFStringRef = *const c_void;
 type CFDictionaryRef = *const c_void;
 type CFSetRef = *const c_void;
+type CFArrayRef = *const c_void;
+type CFMutableDictionaryRef = *mut c_void;
 type CFAllocatorRef = *const c_void;
 type IOHIDManagerRef = *const c_void;
 type IOHIDDeviceRef = *const c_void;
@@ -81,6 +83,28 @@ unsafe extern "C" {
     fn CFNumberGetValue(n: CFTypeRef, the_type: CFIndex, value_ptr: *mut c_void) -> u8;
     fn CFSetGetCount(s: CFSetRef) -> CFIndex;
     fn CFSetGetValues(s: CFSetRef, values: *mut CFTypeRef);
+    fn CFNumberCreate(
+        alloc: CFAllocatorRef,
+        the_type: CFIndex,
+        value_ptr: *const c_void,
+    ) -> CFTypeRef;
+    fn CFDictionaryCreateMutable(
+        alloc: CFAllocatorRef,
+        capacity: CFIndex,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> CFMutableDictionaryRef;
+    fn CFDictionarySetValue(d: CFMutableDictionaryRef, key: CFTypeRef, value: CFTypeRef);
+    fn CFArrayCreate(
+        alloc: CFAllocatorRef,
+        values: *const CFTypeRef,
+        count: CFIndex,
+        callbacks: *const c_void,
+    ) -> CFArrayRef;
+    // Only their addresses are used; the contents are CoreFoundation's.
+    static kCFTypeDictionaryKeyCallBacks: u8;
+    static kCFTypeDictionaryValueCallBacks: u8;
+    static kCFTypeArrayCallBacks: u8;
     static kCFRunLoopDefaultMode: CFStringRef;
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source: u8) -> i32;
@@ -90,6 +114,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn IOHIDManagerCreate(alloc: CFAllocatorRef, options: u32) -> IOHIDManagerRef;
     fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFDictionaryRef);
+    fn IOHIDManagerSetDeviceMatchingMultiple(manager: IOHIDManagerRef, multiple: CFArrayRef);
     fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) -> CFSetRef;
     fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) -> IOReturn;
     fn IOHIDDeviceGetProperty(device: IOHIDDeviceRef, key: CFStringRef) -> CFTypeRef;
@@ -173,17 +198,80 @@ fn string_property(device: IOHIDDeviceRef, key: &str) -> Option<String> {
     (ok != 0).then(|| unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into())
 }
 
-/// Every HID device this process can see, as raw references. The caller must
-/// not outlive the manager, which is why this is private and both users take
-/// what they need inside it.
-fn with_devices<T>(f: impl FnOnce(&[IOHIDDeviceRef]) -> T) -> Option<T> {
+/// A matching array for `ids` — one `{VendorID, ProductID}` dictionary each —
+/// or null for none, which matches every device. Owned by the caller.
+fn matching(ids: &[(u16, u16)]) -> CFArrayRef {
+    if ids.is_empty() {
+        return std::ptr::null();
+    }
+    let number = |n: u16| {
+        let n = i32::from(n);
+        unsafe {
+            CFNumberCreate(kCFAllocatorDefault, K_CF_NUMBER_SINT32_TYPE, (&raw const n).cast())
+        }
+    };
+    let (vk, pk) = (cfstr("VendorID"), cfstr("ProductID"));
+    let dicts: Vec<CFTypeRef> = ids
+        .iter()
+        .map(|&(v, p)| {
+            let d = unsafe {
+                CFDictionaryCreateMutable(
+                    kCFAllocatorDefault,
+                    2,
+                    (&raw const kCFTypeDictionaryKeyCallBacks).cast(),
+                    (&raw const kCFTypeDictionaryValueCallBacks).cast(),
+                )
+            };
+            let (vn, pn) = (number(v), number(p));
+            unsafe {
+                CFDictionarySetValue(d, vk, vn);
+                CFDictionarySetValue(d, pk, pn);
+                // The dictionary retained both.
+                CFRelease(vn);
+                CFRelease(pn);
+            }
+            d.cast_const()
+        })
+        .collect();
+    let array = unsafe {
+        CFArrayCreate(
+            kCFAllocatorDefault,
+            dicts.as_ptr(),
+            dicts.len() as CFIndex,
+            (&raw const kCFTypeArrayCallBacks).cast(),
+        )
+    };
+    unsafe {
+        for d in dicts {
+            CFRelease(d);
+        }
+        CFRelease(vk);
+        CFRelease(pk);
+    }
+    array
+}
+
+/// Every HID device this process can see with one of `ids` (any, for none),
+/// as raw references. The caller must not outlive the manager, which is why
+/// this is private and both users take what they need inside it.
+fn with_devices<T>(ids: &[(u16, u16)], f: impl FnOnce(&[IOHIDDeviceRef]) -> T) -> Option<T> {
     let manager = unsafe { IOHIDManagerCreate(kCFAllocatorDefault, K_IOHID_OPTIONS_TYPE_NONE) };
     if manager.is_null() {
         return None;
     }
-    // Null matching dictionary: every HID device. Filtering happens here rather
-    // than in IOKit because the ids are already a list this crate holds.
-    unsafe { IOHIDManagerSetDeviceMatching(manager, std::ptr::null()) };
+    // Matched in IOKit, so the manager never opens a device that is not
+    // wanted: the RC-28 worker looks once a second while none is plugged in,
+    // and an open of every keyboard on the machine each time would be both
+    // slow and, since Catalina, an Input Monitoring prompt.
+    let wanted = matching(ids);
+    if wanted.is_null() {
+        unsafe { IOHIDManagerSetDeviceMatching(manager, std::ptr::null()) };
+    } else {
+        unsafe {
+            IOHIDManagerSetDeviceMatchingMultiple(manager, wanted);
+            CFRelease(wanted);
+        }
+    }
     unsafe { IOHIDManagerOpen(manager, K_IOHID_OPTIONS_TYPE_NONE) };
     let set = unsafe { IOHIDManagerCopyDevices(manager) };
     if set.is_null() {
@@ -203,8 +291,11 @@ pub struct MacHid {
     device: IOHIDDeviceRef,
     key: String,
     /// Where the input-report callback puts what it receives, once a read has
-    /// scheduled the device. Boxed: IOKit holds a pointer to it.
-    inbox: Option<Box<Inbox>>,
+    /// scheduled the device. A raw pointer from `Box::into_raw`, not a `Box`:
+    /// IOKit holds it too and writes through it from the callbacks, which a
+    /// `Box` — a unique owner — would forbid. Freed in `Drop`, after the
+    /// callbacks are detached.
+    inbox: Option<*mut Inbox>,
 }
 
 /// Input reports received and not yet read, and whether the device has gone.
@@ -250,23 +341,23 @@ unsafe impl Send for MacHid {}
 
 impl Drop for MacHid {
     fn drop(&mut self) {
-        if let Some(inbox) = self.inbox.as_mut() {
+        if let Some(ctx) = self.inbox.take() {
             // Detach the callbacks before the inbox they point at is freed.
-            let ctx: *mut Inbox = &mut **inbox;
+            // Nothing else reaches the inbox now: the callbacks only run inside
+            // this thread's run loop, which is not running.
             unsafe {
+                let (buf, len, run_loop) =
+                    ((*ctx).buf.as_mut_ptr(), (*ctx).buf.len(), (*ctx).run_loop);
                 IOHIDDeviceRegisterInputReportCallback(
                     self.device,
-                    inbox.buf.as_mut_ptr(),
-                    inbox.buf.len() as CFIndex,
+                    buf,
+                    len as CFIndex,
                     None,
                     ctx.cast(),
                 );
                 IOHIDDeviceRegisterRemovalCallback(self.device, None, ctx.cast());
-                IOHIDDeviceUnscheduleFromRunLoop(
-                    self.device,
-                    inbox.run_loop,
-                    kCFRunLoopDefaultMode,
-                );
+                IOHIDDeviceUnscheduleFromRunLoop(self.device, run_loop, kCFRunLoopDefaultMode);
+                drop(Box::from_raw(ctx));
             }
         }
         unsafe {
@@ -340,49 +431,58 @@ impl HidDev for MacHid {
         body: &mut [u8],
         timeout: std::time::Duration,
     ) -> Result<Option<usize>> {
-        if self.inbox.is_none() {
-            let mut inbox = Box::new(Inbox {
-                run_loop: unsafe { CFRunLoopGetCurrent() },
-                // Far longer than any report a device supported here sends.
-                buf: vec![0u8; 1024],
-                reports: std::collections::VecDeque::new(),
-                removed: false,
-            });
-            let ctx: *mut Inbox = &mut *inbox;
-            unsafe {
-                IOHIDDeviceRegisterInputReportCallback(
-                    self.device,
-                    inbox.buf.as_mut_ptr(),
-                    inbox.buf.len() as CFIndex,
-                    Some(on_report),
-                    ctx.cast(),
-                );
-                IOHIDDeviceRegisterRemovalCallback(self.device, Some(on_removal), ctx.cast());
-                IOHIDDeviceScheduleWithRunLoop(self.device, inbox.run_loop, kCFRunLoopDefaultMode);
+        let ctx = match self.inbox {
+            Some(ctx) => ctx,
+            None => {
+                let ctx = Box::into_raw(Box::new(Inbox {
+                    run_loop: unsafe { CFRunLoopGetCurrent() },
+                    // Far longer than any report a device supported here sends.
+                    buf: vec![0u8; 1024],
+                    reports: std::collections::VecDeque::new(),
+                    removed: false,
+                }));
+                unsafe {
+                    IOHIDDeviceRegisterInputReportCallback(
+                        self.device,
+                        (*ctx).buf.as_mut_ptr(),
+                        (*ctx).buf.len() as CFIndex,
+                        Some(on_report),
+                        ctx.cast(),
+                    );
+                    IOHIDDeviceRegisterRemovalCallback(self.device, Some(on_removal), ctx.cast());
+                    IOHIDDeviceScheduleWithRunLoop(
+                        self.device,
+                        (*ctx).run_loop,
+                        kCFRunLoopDefaultMode,
+                    );
+                }
+                self.inbox = Some(ctx);
+                ctx
             }
-            self.inbox = Some(inbox);
-        }
-        let take = |inbox: &mut Inbox, body: &mut [u8]| {
+        };
+        // Each look at the inbox is a borrow that ends before the run loop
+        // runs, since the callbacks write through the same pointer in there.
+        let take = |body: &mut [u8]| {
+            let inbox = unsafe { &mut *ctx };
             inbox.reports.pop_front().map(|r| {
                 let k = r.len().min(body.len());
                 body[..k].copy_from_slice(&r[..k]);
                 k
             })
         };
-        let Some(inbox) = self.inbox.as_mut() else { return Ok(None) };
-        if let Some(k) = take(inbox, body) {
+        let removed = || unsafe { (*ctx).removed };
+        if let Some(k) = take(body) {
             return Ok(Some(k));
         }
-        if !inbox.removed {
+        if !removed() {
             // Returns after the first source handled, so a report is picked up
             // as soon as it lands rather than at the end of the timeout.
             unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout.as_secs_f64(), 1) };
         }
-        let Some(inbox) = self.inbox.as_mut() else { return Ok(None) };
-        if let Some(k) = take(inbox, body) {
+        if let Some(k) = take(body) {
             return Ok(Some(k));
         }
-        if inbox.removed {
+        if removed() {
             return Err(Error::NotFound { key: self.key.clone() });
         }
         Ok(None)
@@ -391,7 +491,8 @@ impl HidDev for MacHid {
 
 pub fn open(key: &str) -> Result<Box<dyn HidDev>> {
     let want: i64 = key.parse().map_err(|_| Error::NotFound { key: key.to_string() })?;
-    let found = with_devices(|devices| {
+    // Any device: the key is a location, not an id, and this runs once.
+    let found = with_devices(&[], |devices| {
         devices.iter().copied().find(|d| number_property(*d, "LocationID") == Some(want)).map(|d| {
             // Retained so it outlives the manager this closure runs under.
             unsafe { CFRetain(d) };
@@ -412,7 +513,7 @@ pub fn open(key: &str) -> Result<Box<dyn HidDev>> {
 }
 
 pub fn enumerate(ids: &[(u16, u16)]) -> Vec<HidEntry> {
-    with_devices(|devices| {
+    with_devices(ids, |devices| {
         let mut out = Vec::new();
         for d in devices.iter().copied() {
             let (Some(v), Some(p)) =
